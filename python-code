@@ -1,0 +1,251 @@
+import json
+import pandas as pd
+from math import floor
+
+# Define the vendor columns (with special handling for eBay)
+VENDOR_COLUMNS = {
+    "AMZ SKU": "Amazon",
+    "CUBECART": "CubeCart",
+    # "WAL ONLINE SKU": "Walmart"
+}
+
+def read_csv_and_generate_json(csv_path: str):
+    # Read the CSV file
+    df = pd.read_csv(csv_path, dtype=str)
+
+    # Check for rows where "MULTIPLE" is 0 and print them
+    zero_multiple_rows = df[df["MULTIPLE"] == '0']
+
+    if not zero_multiple_rows.empty:
+        print("Rows with MULTIPLE = 0:")
+        print(zero_multiple_rows)
+
+    # Prepare the JSON output list
+    json_output = []
+
+    # Iterate over each row in DataFrame
+    for index, row in df.iterrows():
+        # Create a dictionary for the current item
+        item = {
+            "FiveM Code": row["FIVEM"],
+            "Multiplier": float(row["MULTIPLE"]),
+            "Vendors": []
+        }
+
+        # Add vendors with single SKU columns
+        for col, vendor_name in VENDOR_COLUMNS.items():
+            if pd.notna(row[col]):
+                item["Vendors"].append({
+                    "vendor": vendor_name,
+                    "codes": [row[col]]
+                })
+
+        # Special handling for eBay which has two SKU columns
+        ebay_codes = []
+        if pd.notna(row["EBAY SKU"]):
+            ebay_codes.append(row["EBAY SKU"])
+        if pd.notna(row["EBAY ONLINE SKU"]):
+            ebay_codes.append(str(row["EBAY ONLINE SKU"]))
+
+        if ebay_codes:
+            item["Vendors"].append({
+                "vendor": "eBay",
+                "codes": ebay_codes
+            })
+
+        # Append the constructed item dictionary to the output list
+        json_output.append(item)
+
+    return json_output
+
+# Classes from models/items.py
+
+class BaseItem:
+    base_code: str
+    children: set["MultItem"]
+    _stock_level: float | None
+
+    def __init__(self, base_code: str) -> None:
+        self.base_code = base_code
+        self.children: set["MultItem"] = set()
+        self._stock_level = None
+
+    def __repr__(self) -> str:
+        return f"BaseNode('{self.base_code}')"
+
+    def __hash__(self) -> int:
+        return hash(self.base_code)
+
+    def add_child(self, node: "MultItem") -> None:
+        self.children.add(node)
+        return
+
+    def set_stock_level(self, stock_level: float) -> None:
+        self._stock_level = stock_level
+        for child in self.children:
+            child.set_stock_level(stock_level)
+
+
+class MultItem:
+    base_code: str
+    multiple: float
+    _parent: BaseItem
+    _stock_level: int
+
+    _vendor_dict: dict[str, str | tuple[str, ...]]
+
+    def __init__(self, base_code: str, multiple: float, parent: BaseItem) -> None:
+        self.base_code = base_code
+        self.multiple = multiple
+        parent.add_child(self)
+        self._parent = parent
+        self._stock_level = 0
+        self._vendor_dict = {}
+
+        return
+
+    def __repr__(self) -> str:
+        return f"VendorItem({self.base_code}, {self.multiple})"
+
+    def __str__(self) -> str:
+        return f"Item {self.base_code} with multiple {self.multiple}"
+
+    def __hash__(self) -> int:
+        return hash((self.base_code, self.multiple))
+
+    def add_code(self, vendor_name: str, vendor_codes: list[str]) -> None:
+        if len(vendor_codes) == 1:
+            self._vendor_dict[vendor_name] = vendor_codes[0]
+        else:
+            self._vendor_dict[vendor_name] = tuple(vendor_codes)
+
+    def set_stock_level(self, stock_level: float) -> None:
+        self._stock_level = floor(stock_level / self.multiple)
+
+    def spit_amazon(self) -> str:
+        if "Amazon" not in self._vendor_dict:
+            raise AttributeError("Vendor Item lacks Amazon data: " + self.__repr__())
+
+        return f"{self._vendor_dict['Amazon']}\t\t\t\t{self._stock_level}\n"
+
+    def spit_ebay(self) -> str:
+        if "eBay" not in self._vendor_dict:
+            raise AttributeError("Vendor Item lacks Ebay data: " + self.__repr__())
+
+        online, retail = self._vendor_dict["eBay"]
+
+        return f"REVISE,{online},{self._stock_level},{retail}\n"
+
+    def spit_walmart(self) -> str:
+        if "Walmart" not in self._vendor_dict:
+            raise AttributeError("Vendor Item lacks Walmart data: " + self.__repr__())
+        raise NotImplemented
+        # return f"{self._vendor_dict['WALMART SKU'],{self._stock_level},?????"
+        # NOTE: Find what last column "fulfillment center" should be, alongside the rest of the empty columns
+
+# Functions from models/sku_mapping.py
+
+def create_items(json_format, vendor_names):
+
+    def extract_information(line_dict) -> tuple[str, float, list[tuple[str, list[str]]]]:
+
+        fivem: str = line_dict['FiveM Code']
+        mult: float = line_dict['Multiplier']
+        vendors: list[tuple[str, list[str]]] = []
+
+        for vendor_line in line_dict['Vendors']:
+            name: str = vendor_line['vendor']
+            codes: list[str] = vendor_line['codes']
+            vendors.append((name, codes))
+
+        return fivem, mult, vendors
+
+    base_dict: dict[str, BaseItem] = {}
+    mult_dict: dict[tuple[str, float], MultItem] = {}
+    vendor_dict: dict[str, dict[str, MultItem]] = {}
+    for vendor_name in vendor_names:
+        vendor_dict[vendor_name] = {}
+
+    for json_dict in json_format:
+        fivem_code, multipler, vendors_list = extract_information(json_dict)
+
+        # Checks for repeats of this FiveM code and multiplier
+        if fivem_code not in base_dict:
+            parent_item = BaseItem(fivem_code)
+            base_dict[fivem_code] = parent_item
+        else:
+            parent_item = base_dict[fivem_code]
+        if (fivem_code, multipler) not in mult_dict:
+            child_item = MultItem(fivem_code, multipler, parent_item)
+            mult_dict[(fivem_code, multipler)] = child_item
+        else:
+            child_item = mult_dict[(fivem_code, multipler)]
+
+        for name, codes in vendors_list:
+            child_item.add_code(name, codes)
+            vendor_dict[name][codes[0]] = child_item
+
+    return base_dict, vendor_dict
+
+
+
+def assign_quantities(filename: str, base_dict: dict[str, BaseItem]) -> None:
+    """
+    Takes in a web list csv as a filename and adjusts given dictionaries of BaseItems and VendorItems accordingly.
+
+    :param filename:
+    :param base_dict:
+    """
+    with open(filename, "r") as f:
+        lines: list[str] = f.read().split("\n")
+        first_line, *lines = lines
+
+    magic_number: int | None = None  # https://www.youtube.com/watch?v=Qji5x8gBVX4
+    for row, word in enumerate(first_line.split(",")):
+        if word == "Stock_Level":
+            magic_number = row
+            break
+    if magic_number is None:
+        raise Exception("Could not find a Stock Level")
+
+    base_code: str
+    stock_level: float
+    line_list: list[str]
+    for line in lines:
+        line_list = line.split(",")
+        base_code = line_list[0]
+        if base_code not in base_dict:
+            continue
+
+        stock_level = float(line_list[magic_number])
+        base_dict[base_code].set_stock_level(stock_level)
+
+    return
+
+
+# Main part of app.py
+VENDOR_NAMES = ("CubeCart", "Amazon", "eBay", "Walmart")
+CSV_PATH = 'data/MASTER_LIST.csv'
+QUANT_PATH = 'data/WEBITEMS.csv'
+
+resulting_json = read_csv_and_generate_json(CSV_PATH)
+# print(json.dumps(resulting_json, indent=4))  # Print the JSON nicely formatted
+
+base_dict, vendor_dict = create_items(resulting_json, VENDOR_NAMES)
+assign_quantities(QUANT_PATH, base_dict)
+
+ebay_output = ""
+for ebay_item in vendor_dict["eBay"].values():
+    ebay_output += ebay_item.spit_ebay()
+# print(ebay_output)
+with open('data/EBAY_FILE.csv', 'w', encoding="utf-8") as f:
+    f.write(ebay_output)
+
+amazon_output = ""
+for amazon_item in vendor_dict["Amazon"].values():
+    amazon_output += amazon_item.spit_amazon()
+# print(amazon_output)
+with open('data/AMAZON_FILE.csv', 'w', encoding="utf-8") as f:
+    f.write(amazon_output)
+
+pass
