@@ -1,0 +1,374 @@
+<?php
+/**
+ * This script reads product data from a CSV file, processes it to generate JSON output,
+ * and then creates vendor-specific files (e.g., for Amazon and eBay) with updated stock levels.
+ * It mimics the functionality of the original Python script, adapted to PHP.
+ */
+
+// Define the vendor columns that are present in the CSV file.
+// These are the columns that will be mapped to their respective vendor names.
+$VENDOR_COLUMNS = [
+    "AMZ SKU" => "Amazon",
+    "CUBECART" => "CubeCart",
+    // Uncomment or add more vendor columns as needed.
+    // "WAL ONLINE SKU" => "Walmart"
+];
+
+/**
+ * Reads a CSV file and generates a structured JSON-like array.
+ *
+ * @param string $csv_path The path to the CSV file.
+ * @return array An array representing the processed data.
+ */
+function read_csv_and_generate_json($csv_path) {
+    // Open the CSV file for reading.
+    $file = fopen($csv_path, 'r');
+
+    // Read the first line to get the headers.
+    $headers = fgetcsv($file);
+
+    // Initialize an empty array to store CSV data.
+    $df = [];
+
+    // Read each line of the CSV file.
+    while ($row = fgetcsv($file)) {
+        // Combine the headers with the corresponding row values.
+        $df[] = array_combine($headers, $row);
+    }
+
+    // Close the CSV file.
+    fclose($file);
+
+    // Prepare an array to store the final JSON output.
+    $json_output = [];
+
+    // Iterate over each row of the CSV data.
+    foreach ($df as $row) {
+        // Create an associative array for the current item.
+        $item = [
+            "FiveM Code" => $row['FIVEM'],
+            "Multiplier" => (float) $row['MULTIPLE'],
+            "Vendors" => []
+        ];
+
+        // Access the global vendor columns.
+        global $VENDOR_COLUMNS;
+
+        // Add vendors with single SKU columns.
+        foreach ($VENDOR_COLUMNS as $col => $vendor_name) {
+            // Check if the column value is not empty.
+            if (!empty($row[$col])) {
+                $item["Vendors"][] = [
+                    "vendor" => $vendor_name,
+                    "codes" => [$row[$col]] // Wrap the code in an array.
+                ];
+            }
+        }
+
+        // Special handling for eBay, which may have two SKU columns.
+        $ebay_codes = [];
+        if (!empty($row["EBAY SKU"])) {
+            $ebay_codes[] = $row["EBAY SKU"];
+        }
+        if (!empty($row["EBAY ONLINE SKU"])) {
+            $ebay_codes[] = $row["EBAY ONLINE SKU"];
+        }
+
+        // If there are any eBay codes, add them to the vendors list.
+        if (!empty($ebay_codes)) {
+            $item["Vendors"][] = [
+                "vendor" => "eBay",
+                "codes" => $ebay_codes
+            ];
+        }
+
+        // Append the constructed item to the output list.
+        $json_output[] = $item;
+    }
+
+    // Return the final JSON-like array.
+    return $json_output;
+}
+
+/**
+ * Class representing a base item.
+ * It holds the base code and references to its child items.
+ */
+class BaseItem {
+    public $base_code;       // The base code (e.g., FiveM code).
+    public $children;        // An array of child MultItem objects.
+    private $_stock_level;   // The stock level for this base item.
+
+    /**
+     * Constructor for the BaseItem class.
+     *
+     * @param string $base_code The base code for the item.
+     */
+    public function __construct($base_code) {
+        $this->base_code = $base_code;
+        $this->children = [];
+        $this->_stock_level = null;
+    }
+
+    /**
+     * Adds a child MultItem to this base item.
+     *
+     * @param MultItem $node The child item to add.
+     */
+    public function add_child($node) {
+        $this->children[] = $node;
+    }
+
+    /**
+     * Sets the stock level for this base item and propagates it to children.
+     *
+     * @param float $stock_level The stock level to set.
+     */
+    public function set_stock_level($stock_level) {
+        $this->_stock_level = $stock_level;
+        // Update stock level for all child items.
+        foreach ($this->children as $child) {
+            $child->set_stock_level($stock_level);
+        }
+    }
+}
+
+/**
+ * Class representing a multiple item (variant of the base item).
+ * It includes vendor-specific codes and stock levels adjusted by a multiplier.
+ */
+class MultItem {
+    public $base_code;           // The base code (e.g., FiveM code).
+    public $multiple;            // The multiplier for stock level adjustment.
+    private $_parent;            // Reference to the parent BaseItem.
+    private $_stock_level;       // The adjusted stock level for this item.
+    private $_vendor_dict;       // Associative array of vendor codes.
+
+    /**
+     * Constructor for the MultItem class.
+     *
+     * @param string $base_code The base code for the item.
+     * @param float $multiple The multiplier for stock adjustment.
+     * @param BaseItem $parent The parent base item.
+     */
+    public function __construct($base_code, $multiple, $parent) {
+        $this->base_code = $base_code;
+        $this->multiple = $multiple;
+        $this->_parent = $parent;
+        // Add this item as a child of the parent base item.
+        $parent->add_child($this);
+        $this->_stock_level = 0;
+        $this->_vendor_dict = [];
+    }
+
+    /**
+     * Adds vendor codes to this item.
+     *
+     * @param string $vendor_name The name of the vendor.
+     * @param array $vendor_codes The codes associated with the vendor.
+     */
+    public function add_code($vendor_name, $vendor_codes) {
+        if (count($vendor_codes) === 1) {
+            // If there's only one code, store it directly.
+            $this->_vendor_dict[$vendor_name] = $vendor_codes[0];
+        } else {
+            // If multiple codes, store them as an array.
+            $this->_vendor_dict[$vendor_name] = $vendor_codes;
+        }
+    }
+
+    /**
+     * Sets the stock level for this item, adjusted by the multiplier.
+     *
+     * @param float $stock_level The base stock level.
+     */
+    public function set_stock_level($stock_level) {
+        // Adjust the stock level by dividing by the multiplier and flooring the result.
+        $this->_stock_level = floor($stock_level / $this->multiple);
+    }
+
+    /**
+     * Generates a string formatted for Amazon output.
+     *
+     * @return string The formatted string for Amazon.
+     * @throws Exception If Amazon data is missing.
+     */
+    public function spit_amazon() {
+        if (!isset($this->_vendor_dict["Amazon"])) {
+            throw new Exception("Vendor Item lacks Amazon data: " . $this->__toString());
+        }
+        // Return the formatted string (tab-separated).
+        return $this->_vendor_dict["Amazon"] . "\t\t\t\t" . $this->_stock_level . "\n";
+    }
+
+    /**
+     * Generates a string formatted for eBay output.
+     *
+     * @return string The formatted string for eBay.
+     * @throws Exception If eBay data is missing.
+     */
+    public function spit_ebay() {
+        if (!isset($this->_vendor_dict["eBay"])) {
+            throw new Exception("Vendor Item lacks eBay data: " . $this->__toString());
+        }
+        // Extract online and retail codes.
+        list($online, $retail) = $this->_vendor_dict["eBay"];
+        // Return the formatted string (comma-separated).
+        return "REVISE,$online,{$this->_stock_level},$retail\n";
+    }
+
+    /**
+     * String representation of the MultItem.
+     *
+     * @return string
+     */
+    public function __toString() {
+        return "MultItem({$this->base_code}, {$this->multiple})";
+    }
+}
+
+/**
+ * Processes the JSON-like data to create items and their vendor-specific mappings.
+ *
+ * @param array $json_format The data array generated from the CSV.
+ * @param array $vendor_names The list of vendor names to consider.
+ * @return array An array containing the base items and vendor dictionaries.
+ */
+function create_items($json_format, $vendor_names) {
+    // Initialize dictionaries to store items.
+    $base_dict = [];    // Base items keyed by their base code.
+    $mult_dict = [];    // Multiplier items keyed by a tuple of base code and multiplier.
+    $vendor_dict = [];  // Vendor-specific items.
+
+    // Initialize vendor dictionaries.
+    foreach ($vendor_names as $vendor_name) {
+        $vendor_dict[$vendor_name] = [];
+    }
+
+    // Process each item in the JSON-like data.
+    foreach ($json_format as $json_dict) {
+        // Extract key information.
+        $fivem_code = $json_dict['FiveM Code'];
+        $multiple = $json_dict['Multiplier'];
+        $vendors_list = $json_dict['Vendors'];
+
+        // Handle base item creation or retrieval.
+        if (!isset($base_dict[$fivem_code])) {
+            // Create a new BaseItem if it doesn't exist.
+            $parent_item = new BaseItem($fivem_code);
+            $base_dict[$fivem_code] = $parent_item;
+        } else {
+            // Retrieve the existing BaseItem.
+            $parent_item = $base_dict[$fivem_code];
+        }
+
+        // Key for mult_dict (need a unique key for the combination).
+        $mult_key = $fivem_code . '_' . $multiple;
+
+        // Handle MultItem creation or retrieval.
+        if (!isset($mult_dict[$mult_key])) {
+            // Create a new MultItem if it doesn't exist.
+            $child_item = new MultItem($fivem_code, $multiple, $parent_item);
+            $mult_dict[$mult_key] = $child_item;
+        } else {
+            // Retrieve the existing MultItem.
+            $child_item = $mult_dict[$mult_key];
+        }
+
+        // Add vendor codes to the MultItem.
+        foreach ($vendors_list as $vendor) {
+            $vendor_name = $vendor['vendor'];
+            $codes = $vendor['codes'];
+            $child_item->add_code($vendor_name, $codes);
+            // Map the first code to the MultItem in the vendor dictionary.
+            $vendor_dict[$vendor_name][$codes[0]] = $child_item;
+        }
+    }
+
+    // Return the base items and vendor dictionaries.
+    return [$base_dict, $vendor_dict];
+}
+
+/**
+ * Assigns stock quantities to base items from a CSV file.
+ *
+ * @param string $filename The path to the CSV file containing stock levels.
+ * @param array &$base_dict Reference to the base items dictionary to update stock levels.
+ * @throws Exception If "Stock_Level" column is not found.
+ */
+function assign_quantities($filename, &$base_dict) {
+    // Read all lines from the file.
+    $lines = file($filename, FILE_IGNORE_NEW_LINES);
+    // Get the header line and split into columns.
+    $header = array_shift($lines);
+    $header_cols = explode(',', $header);
+
+    // Find the index of the "Stock_Level" column.
+    $stock_level_col = array_search('Stock_Level', $header_cols);
+    if ($stock_level_col === false) {
+        throw new Exception("Could not find a Stock Level");
+    }
+
+    // Process each line in the CSV.
+    foreach ($lines as $line) {
+        $line_list = explode(',', $line);
+        $base_code = $line_list[0]; // Assuming base code is the first column.
+        // Check if the base code exists in the base items dictionary.
+        if (!isset($base_dict[$base_code])) {
+            continue; // Skip if not found.
+        }
+
+        // Get the stock level and convert to float.
+        $stock_level = (float) $line_list[$stock_level_col];
+        // Set the stock level for the base item, which propagates to its children.
+        $base_dict[$base_code]->set_stock_level($stock_level);
+    }
+}
+
+// Main code execution starts here.
+
+// Define the list of vendor names to be considered.
+$VENDOR_NAMES = ["CubeCart", "Amazon", "eBay", "Walmart"];
+
+// Define the paths to the CSV files.
+$CSV_PATH = 'data/MASTER_LIST.csv';  // The main data CSV file.
+$QUANT_PATH = 'data/WEBITEMS.csv';   // The CSV file containing stock quantities.
+
+// Read the CSV and generate the JSON-like data structure.
+$resulting_json = read_csv_and_generate_json($CSV_PATH);
+
+// Create items and vendor mappings from the generated data.
+list($base_dict, $vendor_dict) = create_items($resulting_json, $VENDOR_NAMES);
+
+// Assign stock quantities to the base items from the stock CSV.
+assign_quantities($QUANT_PATH, $base_dict);
+
+// Generate eBay output file.
+
+// Initialize an empty string to hold the eBay output.
+$ebay_output = "";
+
+// Iterate over all eBay items in the vendor dictionary.
+foreach ($vendor_dict["eBay"] as $ebay_item) {
+    // Append the formatted string for each eBay item.
+    $ebay_output .= $ebay_item->spit_ebay();
+}
+
+// Write the eBay output to a file.
+file_put_contents('data/EBAY_FILE.csv', $ebay_output);
+
+// Generate Amazon output file.
+
+// Initialize an empty string to hold the Amazon output.
+$amazon_output = "";
+
+// Iterate over all Amazon items in the vendor dictionary.
+foreach ($vendor_dict["Amazon"] as $amazon_item) {
+    // Append the formatted string for each Amazon item.
+    $amazon_output .= $amazon_item->spit_amazon();
+}
+
+// Write the Amazon output to a file.
+file_put_contents('data/AMAZON_FILE.csv', $amazon_output);
+
+?>
